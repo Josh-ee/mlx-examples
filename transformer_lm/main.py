@@ -2,6 +2,7 @@
 
 import math
 import time
+from functools import partial
 
 import datasets
 import mlx.core as mx
@@ -36,11 +37,6 @@ class TransformerLM(nn.Module):
         x = x + self.pe(mx.arange(L))
         x = self.transformer(x, mask)
         return self.out_proj(x)
-
-    def loss(self, x, y, reduce=True):
-        logits = self(x)
-        losses = nn.losses.cross_entropy(logits, y)
-        return mx.mean(losses) if reduce else mx.mean(losses, axis=(-1, -2))
 
 
 def to_samples(context_size, dataset):
@@ -88,31 +84,42 @@ def main(args):
     )
     print(f"Training a transformer with {nparams / 1024**2:.3f} M parameters")
 
+    def loss_fn(model, x, y, reduce=True):
+        logits = model(x)
+        losses = nn.losses.cross_entropy(logits, y)
+        return mx.mean(losses) if reduce else mx.mean(losses, axis=(-1, -2))
+
     optimizer = optim.AdamW(
         learning_rate=args.learning_rate, weight_decay=args.weight_decay
     )
-    loss_and_grad_fn = nn.value_and_grad(model, model.loss)
 
-    def eval_fn(model, dataset):
+    def eval_fn(dataset):
         inputs, targets = map(mx.array, to_samples(context_size, dataset))
         loss = 0
         for s in range(0, targets.shape[0], batch_size):
             bx, by = inputs[s : s + batch_size], targets[s : s + batch_size]
             bx, by = map(mx.array, (bx, by))
-            losses = model.loss(bx, by, reduce=False)
+            losses = loss_fn(model, bx, by, reduce=False)
             loss += mx.sum(losses).item()
         return loss / len(targets)
+
+    state = [model.state, optimizer.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def step(inputs, targets):
+        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+        loss, grads = loss_and_grad_fn(model, inputs, targets)
+        optimizer.update(model, grads)
+        return loss
 
     train_iterator = iterate_batches(batch_size, context_size, train)
     losses = []
     tic = time.perf_counter()
     for it, (inputs, targets) in zip(range(args.num_iters), train_iterator):
         inputs, targets = map(mx.array, (inputs, targets))
-        loss, grads = loss_and_grad_fn(inputs, targets)
         optimizer.learning_rate = min(1, it / args.lr_warmup) * args.learning_rate
-        optimizer.update(model, grads)
-        del grads
-        mx.eval(loss, model.parameters())
+        loss = step(inputs, targets)
+        mx.eval(state)
         losses.append(loss.item())
         if (it + 1) % steps_per_report == 0:
             train_loss = np.mean(losses)
@@ -124,7 +131,7 @@ def main(args):
             losses = []
             tic = time.perf_counter()
         if (it + 1) % steps_per_eval == 0:
-            val_loss = eval_fn(model, valid)
+            val_loss = eval_fn(valid)
             toc = time.perf_counter()
             print(
                 f"Iter {it + 1}: "
@@ -135,7 +142,7 @@ def main(args):
             tic = time.perf_counter()
 
     if args.eval_test:
-        test_loss = eval_fn(model, test)
+        test_loss = eval_fn(test)
         test_ppl = math.exp(test_loss)
         print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
 
@@ -182,7 +189,7 @@ if __name__ == "__main__":
         "--num_iters", type=int, default=100000, help="Iterations to train for."
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=3e-4, help="SGD learning rate."
+        "--learning_rate", type=float, default=3e-4, help="AdamW learning rate."
     )
     parser.add_argument(
         "--weight_decay", type=float, default=1e-5, help="Set the weight decay"

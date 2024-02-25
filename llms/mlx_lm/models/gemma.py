@@ -1,11 +1,11 @@
 from dataclasses import dataclass
+from functools import partial
 from typing import Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs
-from .layers import RMSNorm
 
 
 @dataclass
@@ -15,24 +15,29 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
+    head_dim: int
     rms_norm_eps: float
     vocab_size: int
     num_key_value_heads: int = None
     rope_theta: float = 10000
     rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
 
-        if self.rope_scaling:
-            required_keys = {"factor", "type"}
-            if not all(key in self.rope_scaling for key in required_keys):
-                raise ValueError(f"rope_scaling must contain keys {required_keys}")
+@partial(mx.compile, shapeless=True)
+def rms_norm(x, weight, eps):
+    x = x.astype(mx.float32)
+    x = x * mx.rsqrt(x.square().mean(-1, keepdims=True) + eps)
+    return (1.0 + weight) * x.astype(weight.dtype)
 
-            if self.rope_scaling["type"] != "linear":
-                raise ValueError("rope_scaling 'type' currently only supports 'linear'")
+
+class RMSNorm(nn.Module):
+    def __init__(self, dims: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = mx.ones((dims,))
+        self.eps = eps
+
+    def __call__(self, x):
+        return rms_norm(x, self.weight, self.eps)
 
 
 class Attention(nn.Module):
@@ -42,10 +47,10 @@ class Attention(nn.Module):
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        self.head_dim = head_dim = args.head_dim
 
         self.repeats = n_heads // n_kv_heads
 
-        head_dim = args.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
@@ -53,16 +58,10 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        rope_scale = (
-            1 / args.rope_scaling["factor"]
-            if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
-            else 1
-        )
         self.rope = nn.RoPE(
             head_dim,
             traditional=args.rope_traditional,
             base=args.rope_theta,
-            scale=rope_scale,
         )
 
     def __call__(
@@ -110,7 +109,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(nn.gelu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TransformerBlock(nn.Module):
@@ -137,7 +136,7 @@ class TransformerBlock(nn.Module):
         return out, cache
 
 
-class LlamaModel(nn.Module):
+class GemmaModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -156,6 +155,7 @@ class LlamaModel(nn.Module):
         cache=None,
     ):
         h = self.embed_tokens(inputs)
+        h = h * (self.args.hidden_size**0.5)
 
         mask = None
         if h.shape[1] > 1:
@@ -175,8 +175,7 @@ class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.model_type = args.model_type
-        self.model = LlamaModel(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.model = GemmaModel(args)
 
     def __call__(
         self,
@@ -184,14 +183,8 @@ class Model(nn.Module):
         cache=None,
     ):
         out, cache = self.model(inputs, cache)
-        return self.lm_head(out), cache
-
-    @staticmethod
-    def sanitize(weights):
-        # Remove unused precomputed rotary freqs
-        return {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
+        out = out @ self.model.embed_tokens.weight.T
+        return out, cache
 
     @property
     def layers(self):

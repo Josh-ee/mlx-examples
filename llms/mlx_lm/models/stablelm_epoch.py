@@ -6,11 +6,13 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs
+from .layers import LayerNorm
 
 
 @dataclass
 class ModelArgs(BaseModelArgs):
     max_position_embeddings: int
+    model_type: str
     vocab_size: int
     hidden_size: int
     num_attention_heads: int
@@ -21,11 +23,6 @@ class ModelArgs(BaseModelArgs):
     norm_eps: float
     rope_theta: float
     use_qkv_bias: bool
-
-
-class LayerNorm(nn.LayerNorm):
-    def __call__(self, x: mx.array) -> mx.array:
-        return super().__call__(x.astype(mx.float32)).astype(x.dtype)
 
 
 class Attention(nn.Module):
@@ -86,12 +83,9 @@ class Attention(nn.Module):
             B, L, self.num_key_value_heads, self.head_dim
         ).transpose(0, 2, 1, 3)
 
-        def repeat(a):
-            a = mx.concatenate([mx.expand_dims(a, 2)] * self.repeats, axis=2)
-            return a.reshape([B, self.num_heads, L, -1])
-
         if self.repeats > 1:
-            keys, values = map(repeat, (keys, values))
+            keys = mx.repeat(keys, self.repeats, axis=1)
+            values = mx.repeat(values, self.repeats, axis=1)
 
         # Add RoPE to the queries and keys and combine them with the cache
         if cache is not None:
@@ -169,6 +163,7 @@ class StableLM(nn.Module):
 class Model(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
+        self.model_type = config.model_type
         self.model = StableLM(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -185,3 +180,7 @@ class Model(nn.Module):
 
         y, cache = self.model(x, mask, cache)
         return self.lm_head(y), cache
+
+    @property
+    def layers(self):
+        return self.model.layers
